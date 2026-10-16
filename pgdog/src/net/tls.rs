@@ -29,6 +29,11 @@ use crate::config::config;
 
 use super::Error;
 
+/// ALPN protocol name registered for PostgreSQL. PostgreSQL 17+ servers
+/// advertise it and libpq 17+ offers it, requiring it for direct TLS
+/// (`sslnegotiation=direct`).
+pub(crate) const ALPN_POSTGRESQL: &[u8] = b"postgresql";
+
 /// TLS acceptor plus the `tls-server-end-point` binding for the leaf
 /// certificate it will present. Kept together so a reload cannot pair a
 /// new acceptor with an old hash (or the reverse) on an in-flight login.
@@ -230,6 +235,11 @@ pub(crate) fn peer_certificate_present(conn: &ServerConnection) -> bool {
         .is_some_and(|certs| !certs.is_empty())
 }
 
+/// The client negotiated the `postgresql` ALPN protocol.
+pub(crate) fn peer_alpn_postgresql(conn: &ServerConnection) -> bool {
+    conn.alpn_protocol() == Some(ALPN_POSTGRESQL)
+}
+
 /// Extract a hostname identity from the first certificate in the chain.
 ///
 /// Prefers the first `dNSName` in the Subject Alternative Name extension and
@@ -360,7 +370,7 @@ fn build_acceptor(cert: &Path, key: &Path, client_ca: Option<&Path>) -> Result<T
     let key = PrivateKeyDer::from_pem_file(key)?;
 
     let builder = rustls::ServerConfig::builder();
-    let config = match client_ca {
+    let mut config = match client_ca {
         Some(path) => {
             let verifier = build_client_cert_verifier(path)?;
             builder.with_client_cert_verifier(verifier)
@@ -368,6 +378,11 @@ fn build_acceptor(cert: &Path, key: &Path, client_ca: Option<&Path>) -> Result<T
         None => builder.with_no_client_auth(),
     }
     .with_single_cert(certificates, key)?;
+
+    // Clients that offer ALPN without `postgresql` are rejected with
+    // a `no_application_protocol` alert, like PostgreSQL 17+. Clients that
+    // don't offer ALPN at all (libpq < 17) are still accepted.
+    config.alpn_protocols = vec![ALPN_POSTGRESQL.to_vec()];
 
     ACCEPTOR_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
 
@@ -525,6 +540,19 @@ fn build_client_config(
         }
         None => Ok(builder.with_no_client_auth()),
     }
+}
+
+/// Client connector trusting the `tests/tls/chain` root CA (server name
+/// `localhost`), offering the given ALPN protocols.
+#[cfg(test)]
+pub(crate) fn test_chain_connector(alpn_protocols: Vec<Vec<u8>>) -> TlsConnector {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tls/chain/root.pem");
+    let roots = load_ca_bundle(&root, "test root").expect("root CA");
+    let mut client = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client.alpn_protocols = alpn_protocols;
+    TlsConnector::from(Arc::new(client))
 }
 
 #[cfg(test)]
@@ -769,6 +797,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn acceptor_negotiates_postgresql_alpn() {
+        crate::logger();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tls/chain");
+        let listener = build_acceptor(
+            &fixtures.join("chain.pem"),
+            &fixtures.join("leaf-key.pem"),
+            None,
+        )
+        .expect("server TLS configuration");
+
+        // (offered by the client, negotiated)
+        let cases = [
+            // libpq 17+.
+            (vec![ALPN_POSTGRESQL.to_vec()], Some(ALPN_POSTGRESQL)),
+            (
+                vec![b"http/1.1".to_vec(), ALPN_POSTGRESQL.to_vec()],
+                Some(ALPN_POSTGRESQL),
+            ),
+            // libpq < 17 doesn't send ALPN; still allowed after an SSLRequest.
+            (vec![], None),
+        ];
+
+        for (offered, negotiated) in cases {
+            let connector = test_chain_connector(offered.clone());
+            let name = ServerName::try_from("localhost").expect("server name");
+            let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+            let (server, client) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    listener.acceptor.accept(server_io),
+                    connector.connect(name, client_io)
+                )
+            })
+            .await
+            .expect("TLS handshake completed")
+            .expect("TLS handshake succeeds");
+
+            assert_eq!(
+                server.get_ref().1.alpn_protocol(),
+                negotiated,
+                "{offered:?}"
+            );
+            assert_eq!(
+                client.get_ref().1.alpn_protocol(),
+                negotiated,
+                "{offered:?}"
+            );
+            assert_eq!(
+                peer_alpn_postgresql(server.get_ref().1),
+                negotiated.is_some()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptor_rejects_foreign_alpn() {
+        crate::logger();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tls/chain");
+        let listener = build_acceptor(
+            &fixtures.join("chain.pem"),
+            &fixtures.join("leaf-key.pem"),
+            None,
+        )
+        .expect("server TLS configuration");
+
+        // E.g. an HTTPS client pointed at PgDog: cross-protocol attacks.
+        let connector = test_chain_connector(vec![b"http/1.1".to_vec()]);
+        let name = ServerName::try_from("localhost").expect("server name");
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let (server, client) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                listener.acceptor.accept(server_io),
+                connector.connect(name, client_io)
+            )
+        })
+        .await
+        .expect("TLS handshake finished");
+
+        let server = server.expect_err("server rejects foreign ALPN");
+        let server = server
+            .get_ref()
+            .and_then(|err| err.downcast_ref::<rustls::Error>());
+        assert_eq!(server, Some(&rustls::Error::NoApplicationProtocol));
+
+        let client = client.expect_err("client gets an alert");
+        let client = client
+            .get_ref()
+            .and_then(|err| err.downcast_ref::<rustls::Error>());
+        assert_eq!(
+            client,
+            Some(&rustls::Error::AlertReceived(
+                rustls::AlertDescription::NoApplicationProtocol
+            ))
+        );
     }
 
     #[test]

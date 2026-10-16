@@ -7,7 +7,9 @@ use crate::backend::databases::{databases, reload, shutdown};
 use crate::config::config;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::net::messages::{FrontendPid, NegotiateProtocolVersion, Startup, hello::SslReply};
-use crate::net::tls::{acceptor, peer_certificate_present, peer_identity};
+use crate::net::tls::{
+    TlsListener, acceptor, peer_alpn_postgresql, peer_certificate_present, peer_identity,
+};
 use crate::net::{self, Stream, tweak};
 use crate::sighup::Sighup;
 use tokio::net::{TcpListener, TcpSocket, TcpStream, lookup_host};
@@ -19,6 +21,34 @@ use tracing::{error, info, warn};
 
 use super::{Client, Error, comms::comms};
 use crate::util::safe_timeout;
+
+/// First byte of a TLS handshake record (ClientHello). A startup message can't
+/// start with it: as a big-endian length, it would be hundreds of megabytes.
+const TLS_HANDSHAKE: u8 = 0x16;
+
+/// What the first byte sent by a new client says about the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstByte {
+    /// The client disconnected without sending anything.
+    Closed,
+    /// The client skipped the `SSLRequest` and started the TLS handshake
+    /// (direct TLS, libpq 17+ `sslnegotiation=direct`).
+    TlsHandshake,
+    /// Startup message, `SSLRequest`, `GSSENCRequest` or `CancelRequest`.
+    Postgres,
+}
+
+impl FirstByte {
+    /// Peek at the first byte without consuming it.
+    async fn peek(stream: &TcpStream) -> std::io::Result<Self> {
+        let mut buf = [0u8; 1];
+        Ok(match stream.peek(&mut buf).await? {
+            0 => Self::Closed,
+            _ if buf[0] == TLS_HANDSHAKE => Self::TlsHandshake,
+            _ => Self::Postgres,
+        })
+    }
+}
 
 /// Client connections listener and handler.
 #[derive(Debug, Clone)]
@@ -201,9 +231,36 @@ impl Listener {
             );
         }
 
-        let mut stream = Stream::plain(stream, config.config.memory.net_buffer);
-
         let tls = acceptor();
+
+        let first_byte = match FirstByte::peek(&stream).await {
+            Ok(first_byte) => first_byte,
+            // Load balancers like AWS ELB use TCP to health check
+            // targets and abruptly disconnect.
+            Err(err) if err.kind() == ErrorKind::ConnectionReset => return Ok(()),
+            Err(err) => return Err(net::Error::Io(err).into()),
+        };
+
+        let mut stream = match first_byte {
+            FirstByte::Closed => return Ok(()),
+
+            FirstByte::TlsHandshake => {
+                // The client speaks TLS already, so we can't send it a Postgres
+                // error. Close the connection, like PostgreSQL does.
+                let Some(tls) = tls.as_ref() else {
+                    warn!("direct TLS connection rejected, TLS is not configured [{addr}]");
+                    return Ok(());
+                };
+                match Self::accept_tls(tls, stream, addr, config.config.memory.net_buffer, true)
+                    .await
+                {
+                    Some(stream) => stream,
+                    None => return Ok(()),
+                }
+            }
+
+            FirstByte::Postgres => Stream::plain(stream, config.config.memory.net_buffer),
+        };
 
         loop {
             let startup = match Startup::from_stream(&mut stream).await {
@@ -225,24 +282,18 @@ impl Listener {
                     if let Some(tls) = tls.as_ref() {
                         stream.send_flush(&SslReply::Yes).await?;
                         let plain = stream.take()?;
-                        let cipher = match tls.accept(plain).await {
-                            Ok(cipher) => cipher,
-                            Err(err) => {
-                                // TLS failure should close the connection
-                                // without telling the client what happened (security).
-                                warn!("TLS handshake failed: {err} [{addr}]");
-                                return Ok(());
-                            }
-                        };
-                        let tls_identity = peer_identity(cipher.get_ref().1);
-                        let tls_client_certificate = peer_certificate_present(cipher.get_ref().1);
-                        stream = Stream::tls(
-                            tokio_rustls::TlsStream::Server(cipher),
+                        stream = match Self::accept_tls(
+                            tls,
+                            plain,
+                            addr,
                             config.config.memory.net_buffer,
-                            tls_identity,
-                            tls_client_certificate,
-                            tls.server_end_point().map(|data| data.to_vec()),
-                        );
+                            false,
+                        )
+                        .await
+                        {
+                            Some(stream) => stream,
+                            None => return Ok(()),
+                        };
                     } else {
                         stream.send_flush(&SslReply::No).await?;
                     }
@@ -291,11 +342,238 @@ impl Listener {
 
         Ok(())
     }
+
+    /// Perform the TLS handshake with a client. Returns `None` if the
+    /// connection should be closed.
+    ///
+    /// Direct TLS connections (no `SSLRequest`) must negotiate the
+    /// `postgresql` ALPN protocol, like PostgreSQL 17+ requires. This stops
+    /// other protocols' clients from being tricked into talking to us
+    /// (cross-protocol attacks). Clients that sent an `SSLRequest` first
+    /// may skip ALPN, since libpq < 17 doesn't send it.
+    async fn accept_tls(
+        tls: &TlsListener,
+        plain: TcpStream,
+        addr: SocketAddr,
+        net_buffer: usize,
+        direct: bool,
+    ) -> Option<Stream> {
+        let cipher = match tls.accept(plain).await {
+            Ok(cipher) => cipher,
+            Err(err) => {
+                // TLS failure should close the connection
+                // without telling the client what happened (security).
+                warn!("TLS handshake failed: {err} [{addr}]");
+                return None;
+            }
+        };
+
+        if direct && !peer_alpn_postgresql(cipher.get_ref().1) {
+            warn!(
+                "direct TLS connection rejected, client did not negotiate the \"postgresql\" ALPN protocol [{addr}]"
+            );
+            return None;
+        }
+
+        let tls_identity = peer_identity(cipher.get_ref().1);
+        let tls_client_certificate = peer_certificate_present(cipher.get_ref().1);
+        Some(Stream::tls(
+            tokio_rustls::TlsStream::Server(cipher),
+            net_buffer,
+            tls_identity,
+            tls_client_certificate,
+            tls.server_end_point().map(|data| data.to_vec()),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::net::messages::ToBytes;
+    use crate::net::tls::{ALPN_POSTGRESQL, test_chain_connector, test_reset_acceptor};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
+    use tokio_rustls::rustls::pki_types::ServerName;
+
+    /// Connected (client, server) TCP pair.
+    async fn tcp_pair() -> (TcpStream, TcpStream, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, addr) = listener.accept().await.unwrap();
+        (client, server, addr)
+    }
+
+    /// Client TCP connection with `handle_client` serving the other end.
+    async fn connect() -> (TcpStream, JoinHandle<Result<(), Error>>) {
+        let (client, server, addr) = tcp_pair().await;
+        let handle = spawn(Listener::handle_client(server, addr));
+        (client, handle)
+    }
+
+    /// Install a TLS acceptor using the `tests/tls/chain` certificate.
+    fn enable_tls() {
+        test_reset_acceptor();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tls/chain");
+        let mut cfg = crate::config::ConfigAndUsers::default();
+        cfg.config.general.tls_certificate = Some(fixtures.join("chain.pem"));
+        cfg.config.general.tls_private_key = Some(fixtures.join("leaf-key.pem"));
+        crate::config::set(cfg).unwrap();
+        crate::net::tls::reload().unwrap();
+    }
+
+    fn disable_tls() {
+        test_reset_acceptor();
+        crate::config::set(crate::config::ConfigAndUsers::default()).unwrap();
+    }
+
+    /// Send a `GSSENCRequest` and return the server's one-byte answer, which
+    /// shows the server is reading startup messages from this stream.
+    async fn gss_enc_reply<S>(stream: &mut S) -> std::io::Result<u8>
+    where
+        S: AsyncReadExt + AsyncWriteExt + Unpin,
+    {
+        stream.write_all(&Startup::GssEnc.to_bytes()).await?;
+        stream.flush().await?;
+        stream.read_u8().await
+    }
+
+    async fn finish(handle: JoinHandle<Result<(), Error>>) -> Result<(), Error> {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("handle_client finished")
+            .expect("handle_client didn't panic")
+    }
+
+    fn localhost() -> ServerName<'static> {
+        ServerName::try_from("localhost").unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_first_byte_tls_handshake() {
+        let (mut client, server, _) = tcp_pair().await;
+        // TLS record header: handshake, TLS 1.0 record version.
+        client.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
+        assert_eq!(
+            FirstByte::peek(&server).await.unwrap(),
+            FirstByte::TlsHandshake
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_byte_postgres() {
+        for message in [
+            Startup::tls().to_bytes(),
+            Startup::new("pgdog", "pgdog", vec![]).to_bytes(),
+        ] {
+            let (mut client, mut server, _) = tcp_pair().await;
+            client.write_all(&message).await.unwrap();
+            assert_eq!(FirstByte::peek(&server).await.unwrap(), FirstByte::Postgres);
+
+            // Peeking doesn't consume anything.
+            let mut read = vec![0u8; message.len()];
+            server.read_exact(&mut read).await.unwrap();
+            assert_eq!(read, message.to_vec());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_first_byte_closed() {
+        let (client, server, _) = tcp_pair().await;
+        drop(client);
+        assert_eq!(FirstByte::peek(&server).await.unwrap(), FirstByte::Closed);
+    }
+
+    #[tokio::test]
+    async fn test_direct_tls_with_alpn() {
+        crate::logger();
+        enable_tls();
+
+        let (client, handle) = connect().await;
+        let mut tls = test_chain_connector(vec![ALPN_POSTGRESQL.to_vec()])
+            .connect(localhost(), client)
+            .await
+            .expect("direct TLS handshake");
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(ALPN_POSTGRESQL));
+        assert_eq!(gss_enc_reply(&mut tls).await.unwrap(), b'N');
+
+        drop(tls);
+        let _ = finish(handle).await;
+        disable_tls();
+    }
+
+    #[tokio::test]
+    async fn test_direct_tls_without_alpn_rejected() {
+        crate::logger();
+        enable_tls();
+
+        let (client, handle) = connect().await;
+        // The handshake can complete on the client's side before the
+        // server checks ALPN; the connection is closed right after.
+        if let Ok(mut tls) = test_chain_connector(vec![])
+            .connect(localhost(), client)
+            .await
+        {
+            assert!(gss_enc_reply(&mut tls).await.is_err());
+        }
+        finish(handle).await.expect("connection closed cleanly");
+        disable_tls();
+    }
+
+    #[tokio::test]
+    async fn test_direct_tls_without_tls_configured() {
+        crate::logger();
+        disable_tls();
+
+        let (client, handle) = connect().await;
+        assert!(
+            test_chain_connector(vec![ALPN_POSTGRESQL.to_vec()])
+                .connect(localhost(), client)
+                .await
+                .is_err()
+        );
+        finish(handle).await.expect("connection closed cleanly");
+    }
+
+    #[tokio::test]
+    async fn test_ssl_request_without_alpn() {
+        crate::logger();
+        enable_tls();
+
+        for alpn in [vec![], vec![ALPN_POSTGRESQL.to_vec()]] {
+            let (mut client, handle) = connect().await;
+            client.write_all(&Startup::tls().to_bytes()).await.unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'S');
+
+            let mut tls = test_chain_connector(alpn)
+                .connect(localhost(), client)
+                .await
+                .expect("TLS handshake after SSLRequest");
+            assert_eq!(gss_enc_reply(&mut tls).await.unwrap(), b'N');
+
+            drop(tls);
+            let _ = finish(handle).await;
+        }
+        disable_tls();
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_startup_unchanged() {
+        crate::logger();
+        disable_tls();
+
+        let (mut client, handle) = connect().await;
+        assert_eq!(gss_enc_reply(&mut client).await.unwrap(), b'N');
+        client.write_all(&Startup::tls().to_bytes()).await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'N');
+
+        drop(client);
+        let _ = finish(handle).await;
+    }
 
     #[tokio::test]
     async fn test_bind_ipv4_applies_configured_backlog() {

@@ -64,7 +64,10 @@ Each accepted TCP socket becomes a Tokio task in `handle_client()`. Before const
 
 ```mermaid
 flowchart TD
-    A[TCP accept] --> B{startup message type}
+    A[TCP accept] --> P{first byte}
+    P -->|0x16| T[direct TLS handshake<br>ALPN postgresql required]
+    T --> B
+    P -->|other| B{startup message type}
     B -->|Ssl| C[TLS handshake]
     C --> F
     B -->|GssEnc| D[send N — client retries]
@@ -74,7 +77,8 @@ flowchart TD
     B -->|Startup| F[Client::spawn]
 ```
 
-- **SSL** (`Startup::Ssl`): wraps the socket in TLS and records the peer certificate for mTLS authentication.
+- **Direct TLS** (first byte `0x16`, libpq 17+ `sslnegotiation=direct`): the client skips the `SSLRequest` and starts the TLS handshake right away. The listener peeks at the first byte and, if TLS is configured, accepts the handshake immediately. Like PostgreSQL 17+, the client must negotiate the `postgresql` ALPN protocol, or the connection is closed. If TLS is not configured, the connection is closed.
+- **SSL** (`Startup::Ssl`): wraps the socket in TLS and records the peer certificate for mTLS authentication. ALPN is optional here, since libpq < 17 doesn't send it, but a client that offers ALPN without `postgresql` is rejected with a `no_application_protocol` alert, like PostgreSQL 17+.
 - **GSS** (`Startup::GssEnc`): not supported. pgdog sends `N` and the client retries.
 - **Cancel** (`Startup::Cancel`): the listener calls `comms().verify_cancel(id)` first. On mismatch, the TCP connection is closed and the running query is unaffected; no error is returned. On success, `databases().cancel(FrontendPid::from(id))` is called and the connection is closed. This occurs before any `Client` exists, which is why the cancel path is separate from the query path.
 - **Startup** (`Startup::Startup`): negotiation complete. Control falls through to `Client::spawn()`.
